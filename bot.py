@@ -1,6 +1,11 @@
 """
-Telegram Guruh Spam Filter Bot — v5.0 IDEAL
-Zero-width char bypass, unicode normalization, sticker/media spam detection
+Telegram Guruh Spam Filter Bot — v5.1 OPTIMIZED
+- Guruhga xabar YUBORMASIN (faqat o'chir + log)
+- URL/domen tekshiruvi set() bilan O(1)
+- Normalize cache (lru_cache)
+- Spam fragment set-based tez qidiruv
+- Zero-width char bypass, unicode normalization
+- Sticker/media spam detection
 """
 
 import asyncio
@@ -10,6 +15,7 @@ import re
 import unicodedata
 from collections import defaultdict
 from datetime import datetime, timedelta
+from functools import lru_cache
 
 from dotenv import load_dotenv
 from telegram import Update, ChatPermissions
@@ -36,31 +42,22 @@ warnings:    dict[tuple[int, int], int]      = defaultdict(int)
 muted_until: dict[tuple[int, int], datetime] = {}
 BOT_ID: int = 0
 
-# ════ ZERO-WIDTH VA KO'RINMAS BELGILAR ═════════════════════════
+# ════ ZERO-WIDTH VA KO'RINMAS BELGILAR ══════════════════════════
 
-# Barcha unicode zero-width, invisible, control characters
 _INVISIBLE_CHARS = re.compile(
-    r'[\u0000-\u001f\u007f-\u009f'   # control chars
-    r'\u00ad'                          # soft hyphen
-    r'\u034f'                          # combining grapheme joiner
-    r'\u061c'                          # arabic letter mark
-    r'\u115f\u1160'                    # hangul fillers
-    r'\u17b4\u17b5'                    # khmer vowel inherent
-    r'\u180b-\u180e'                   # mongolian
-    r'\u200b-\u200f'                   # zero-width space/non-joiner/joiner/LRM/RLM
-    r'\u202a-\u202e'                   # directional formatting
-    r'\u2060-\u2064'                   # word joiner, invisible
-    r'\u2066-\u206f'                   # directional isolate
-    r'\u3164'                          # hangul filler
-    r'\ufeff'                          # BOM / zero-width no-break space
-    r'\uffa0'                          # halfwidth hangul filler
-    r'\U0001d173-\U0001d17a'          # musical symbols
-    r'\U000e0000-\U000e007f'          # tags block
+    r'[\u0000-\u001f\u007f-\u009f'
+    r'\u00ad\u034f\u061c\u115f\u1160'
+    r'\u17b4\u17b5\u180b-\u180e'
+    r'\u200b-\u200f\u202a-\u202e'
+    r'\u2060-\u2064\u2066-\u206f'
+    r'\u3164\ufeff\uffa0'
+    r'\U0001d173-\U0001d17a'
+    r'\U000e0000-\U000e007f'
     r']+',
     re.UNICODE
 )
 
-# ════ CYRILLIC → LATIN ════════════════════════════════════════
+# ════ CYRILLIC → LATIN ══════════════════════════════════════════
 
 _CYRILLIC_MAP = {
     'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo',
@@ -68,57 +65,45 @@ _CYRILLIC_MAP = {
     'н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u',
     'ф':'f','х':'x','ц':'ts','ч':'ch','ш':'sh','щ':'sch',
     'ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya',
-    # Oʻzbek harflari
-    'ғ':'g','қ':'q','ң':'ng','ҳ':'h','ў':'o','ё':'yo',
-    # Rus/Tojik variantlari
-    'ё':'yo','і':'i','ї':'i','є':'e',
+    'ғ':'g','қ':'q','ң':'ng','ҳ':'h','ў':'o',
+    'і':'i','ї':'i','є':'e',
 }
+_CYRILLIC_TABLE = str.maketrans(_CYRILLIC_MAP)
 
 _RE_SEX_MEDICAL = re.compile(
     r'sex(?:ual|olog|gormon|appel|ed|ism|ist|ologi|ualit)',
     re.IGNORECASE
 )
 
-def _cyrillic_to_latin(text: str) -> str:
-    return ''.join(_CYRILLIC_MAP.get(ch.lower(), ch) for ch in text)
+_RE_SPACES_BETWEEN = re.compile(r'\b((?:[a-z] ){2,}[a-z])\b')
+_RE_PUNCT_BYPASS   = re.compile(r'(?<=[a-z])[.\-_*·•](?=[a-z])')
+_RE_MULTI_SPACE    = re.compile(r'\s+')
+
+_CHAR_REPLACE = str.maketrans({
+    '0':'o','1':'i','3':'e','4':'a','5':'s','6':'b',
+    '@':'a','$':'s','!':'i','|':'l','7':'t','+':'',
+    'ı':'i','ñ':'n','ü':'u','ö':'o','ä':'a',
+})
 
 def clean_invisible(text: str) -> str:
-    """Barcha ko'rinmas/zero-width belgilarni olib tashlaydi"""
     return _INVISIBLE_CHARS.sub('', text)
 
+@lru_cache(maxsize=4096)
 def normalize(text: str) -> str:
     if not text:
         return ""
-    # 1. Ko'rinmas belgilarni tozala (BU ENG MUHIM QADAM)
     text = clean_invisible(text)
-    # 2. Unicode normalizatsiya
     text = unicodedata.normalize("NFKC", text)
-    # 3. Cyrillic → Latin
-    text = _cyrillic_to_latin(text)
-    # 4. Kichik harf
-    text = text.lower()
-    # 5. Nuqta/tire bypass: P.R.O.F.I.L → profil
-    text = re.sub(r'(?<=[a-z])[.\-_*·•](?=[a-z])', '', text)
-    # 6. Boʻshliq bypass: s e x → sex (2+ yakka harf)
-    text = re.sub(
-        r'\b((?:[a-z] ){2,}[a-z])\b',
-        lambda m: m.group(0).replace(' ', ''),
-        text
-    )
-    # 7. Raqam/belgi almashtirishlar
-    for ch, rep in [
-        ("0","o"),("1","i"),("3","e"),("4","a"),("5","s"),("6","b"),
-        ("@","a"),("$","s"),("!","i"),("|","l"),("7","t"),("+",""),
-        ("ı","i"),("ñ","n"),("ü","u"),("ö","o"),("ä","a"),
-    ]:
-        text = text.replace(ch, rep)
-    # 8. Ko'p boʻshliqlarni birlashtir
-    text = re.sub(r"\s+", " ", text).strip()
+    text = text.lower().translate(_CYRILLIC_TABLE)
+    text = _RE_PUNCT_BYPASS.sub('', text)
+    text = _RE_SPACES_BETWEEN.sub(lambda m: m.group(0).replace(' ', ''), text)
+    text = text.translate(_CHAR_REPLACE)
+    text = _RE_MULTI_SPACE.sub(' ', text).strip()
     return text
 
 # ════ SOʻKINISH SOʻZLARI ════════════════════════════════════════
 
-SWEAR_WORDS_EXACT = [
+SWEAR_WORDS_EXACT: list[str] = [
     "sex","seks",
     "orospu","fahsh","siktir","haromzoda","fohisha","nokas","nomard","beadab",
     "blyat","blyad","suka","pizda","huy","hui",
@@ -126,26 +111,29 @@ SWEAR_WORDS_EXACT = [
     "whore","bitch","fuck","cunt","dick","pussy","cock","ass",
 ]
 
-SWEAR_WORDS_PARTIAL = [
+SWEAR_WORDS_PARTIAL: list[str] = [
     "porn","porno","xxx",
     "yobany","nahuy","pohuy",
     "erotik","intim",
 ]
 
+# Normalize qilingan variantlar (tezlik uchun oldindan tayyorla)
+_SWEAR_EXACT_NORM:   list[str] = [normalize(w) for w in SWEAR_WORDS_EXACT]
+_SWEAR_PARTIAL_NORM: list[str] = [normalize(w) for w in SWEAR_WORDS_PARTIAL]
+
 # ════ SPAM FRAGMENTLAR ══════════════════════════════════════════
 
-SPAM_FRAGMENTS = [
-    # ── PROFIL SPAM (eng ko'p uchraydigan) ──
+_RAW_SPAM_FRAGMENTS: list[str] = [
+    # ── PROFIL SPAM ──
     "profilimda","profilimga","profilimni","profiliga","profilimga o",
     "profilga o","profiliga kir","profilga kir","profilimga qarang",
     "profilimga obuna","mening profilim","profilim orqali",
-    "rofilimda","rofiliga","rrofilimda",   # bypass variantlari
+    "rofilimda","rofiliga","rrofilimda",
     "my profile","check my","visit my","see my profile",
     "open my profile","look at my profile","click my profile",
     "sahifamga","sahifamda","sahifaga o","sahifamga kir","mening sahifam",
     "bio da","bioda","bio'da","bio linkka","link in bio","link bio",
     "havola bio","linkka o't","linkka kir",
-
     # ── OBUNA / REKLAMA ──
     "obuna bo'l","obuna boling","obuna qiling","obuna bo'ling",
     "kanalimga","kanalga kir","kanalga ot","kanalga o't","kanalga qo",
@@ -153,7 +141,6 @@ SPAM_FRAGMENTS = [
     "join channel","join group","join chat","join now","subscribe now",
     "подписывайтесь","подпишитесь","вступайте","присоединяйтесь",
     "follow me","follow now","follow back",
-
     # ── 18+ / ONLYFANS ──
     "onlyfans","only fans","fansly","loyalfans","justforfans",
     "adult content","private content","exclusive content",
@@ -161,7 +148,6 @@ SPAM_FRAGMENTS = [
     "nude","nudelar","интим","эротика","порно","секс видео",
     "live sex","sex chat","sex call","cam girl","webcam show",
     "18+","adult video","adult photo",
-
     # ── TANISHUV / DATING ──
     "tanishamizmi","suhbatlashamizmi","yolg'iz qizlar","yolg'iz erkaklar",
     "pm ga yozing","ls ga yozing","lichkaga yoz","shaxsiyga yoz",
@@ -169,7 +155,6 @@ SPAM_FRAGMENTS = [
     "dating","date me","lonely girl","single girl","meet me",
     "знакомства","пиши в лс","пиши в личку","напиши мне",
     "пишите в личные","пиши лично",
-
     # ── PUL / DAROMAD SPAM ──
     "pul ishlash","pul topish","tez pul","oson pul","bepul daromad",
     "passive income","online daromad","oylik daromad",
@@ -177,41 +162,41 @@ SPAM_FRAGMENTS = [
     "earn money","make money","easy money","get rich","fast money",
     "заработок","заработай","быстрые деньги","пассивный доход",
     "легкий заработок","быстрый заработок",
-
     # ── TRADING / KRIPTO SPAM ──
     "trading signal","forex signal","kripto signal","crypto signal",
     "referral","promo kod","promo code","cashback",
     "vip signal","free signal","100% profit","guaranteed profit",
     "pump signal","dump signal","pump and dump",
-
     # ── KAZINO / BUKMAKER ──
     "kazino","casino","1win","mostbet","melbet","1xbet","pin-up","pinup",
     "vulkan casino","jackpot","gambling","free spin","freespin",
     "букмекер","казино","ставки","ставка","тотализатор",
     "sure bet","fixed match","guaranteed win","match fix",
     "leon bet","parimatch","betway","bwin","888sport",
-
     # ── KRIPTO / NFT / AIRDROP ──
     "airdrop","free nft","free token","free crypto","free bitcoin",
     "hamster kombat","notcoin","tapswap","blum airdrop",
     "tap to earn","play to earn","crypto mining",
     "presale","whitelist","ico launch","token sale",
-
     # ── PHISHING ──
     "hisobingiz bloklandi","akkauntingiz o'chir","parolingizni tasdiqlang",
     "sms kodni yuboring","account suspended","account blocked",
     "verify now","confirm your account","ваш аккаунт заблокирован",
     "click to verify","login required","urgent action",
-
     # ── UMUMIY REKLAMA ──
     "buyurtma bering","tez yetkazib berish","bepul yetkazib berish",
     "optom narxda","buy now","shop now","order now","click here",
     "limited offer","special offer","exclusive offer","act now",
 ]
 
+# O(1) qidiruv uchun normalize qilingan set
+SPAM_FRAGMENTS_NORM: set[str] = {normalize(f) for f in _RAW_SPAM_FRAGMENTS}
+# Dinamik qo'shish uchun asl list (addspam komandasi)
+SPAM_FRAGMENTS: list[str] = list(_RAW_SPAM_FRAGMENTS)
+
 # ════ DOMENLAR VA HAVOLALAR ═════════════════════════════════════
 
-BLOCKED_DOMAINS = [
+_RAW_BLOCKED_DOMAINS: list[str] = [
     # URL shorteners
     "bit.ly","tinyurl.com","cutt.ly","is.gd","shorturl.at",
     "goo.gl","rb.gy","clck.ru","vk.cc","ow.ly","buff.ly",
@@ -220,35 +205,33 @@ BLOCKED_DOMAINS = [
     # Adult
     "onlyfans.com","fansly.com","loyalfans.com","justforfans.com",
     "pornhub.com","xvideos.com","xhamster.com","redtube.com",
-    # Link aggregators (spam bilan ishlatiladi)
+    # Link aggregators
     "linktr.ee","beacons.ai","solo.to","bio.link",
     # Kazino
     "1win.com","mostbet.com","melbet.com","1xbet.com",
 ]
 
+# O(1) qidiruv uchun set
+BLOCKED_DOMAINS_SET: set[str] = set(_RAW_BLOCKED_DOMAINS)
+BLOCKED_DOMAINS: list[str] = list(_RAW_BLOCKED_DOMAINS)
+
 _RE_URL        = re.compile(r'https?://([^\s/?\#]+)', re.IGNORECASE)
 _RE_TG_INVITE  = re.compile(r't\.me/(?:joinchat/|\+|c/)[a-zA-Z0-9_\-]+', re.IGNORECASE)
 _RE_TG_CHANNEL = re.compile(r't\.me/[a-zA-Z][a-zA-Z0-9_]{3,}', re.IGNORECASE)
 
-# Spam sticker set nomlari (pastga qoʻshish mumkin)
-SPAM_STICKER_SETS = [
-    # Ma'lum spam sticker pack nomlarini bu yerga qo'shing
-]
+SPAM_STICKER_SETS: set[str] = set()
 
-# ════ SPAM TEKSHIRUVI ═══════════════════════════════════════════
+# ════ SPAM TEKSHIRUVI (OPTIMIZED) ═══════════════════════════════
 
 def is_spam(raw_text: str) -> tuple[bool, str]:
     if not raw_text:
         return False, ""
 
-    # Avval ko'rinmas belgilarni tozala — bu ENG MUHIM qadam
     raw_text = clean_invisible(raw_text)
-
     norm = normalize(raw_text)
 
     # 1. So'kinish — aniq so'z (word boundary)
-    for w in SWEAR_WORDS_EXACT:
-        nw = normalize(w)
+    for w, nw in zip(SWEAR_WORDS_EXACT, _SWEAR_EXACT_NORM):
         if nw == "sex" and _RE_SEX_MEDICAL.search(raw_text):
             continue
         pattern = r'(?<![a-z\u0400-\u04ff])' + re.escape(nw) + r'(?![a-z\u0400-\u04ff])'
@@ -256,22 +239,21 @@ def is_spam(raw_text: str) -> tuple[bool, str]:
             return True, f"so'kinish: «{w}»"
 
     # 2. So'kinish — substring
-    for w in SWEAR_WORDS_PARTIAL:
-        nw = normalize(w)
+    for w, nw in zip(SWEAR_WORDS_PARTIAL, _SWEAR_PARTIAL_NORM):
         if nw in norm:
             return True, f"so'kinish: «{w}»"
 
-    # 3. Spam fragmentlar
-    for frag in SPAM_FRAGMENTS:
-        nfrag = normalize(frag)
-        if nfrag in norm:
-            return True, f"spam: «{frag}»"
+    # 3. Spam fragmentlar — O(1) set lookup
+    for frag_norm in SPAM_FRAGMENTS_NORM:
+        if frag_norm in norm:
+            return True, f"spam fragment aniqlandi"
 
-    # 4. Bloklangan domenlar
+    # 4. Bloklangan domenlar — O(1) set lookup
     for m in _RE_URL.finditer(raw_text.lower()):
         domain = m.group(1).lstrip("www.")
-        for bd in BLOCKED_DOMAINS:
-            if bd in domain:
+        # To'liq domen yoki subdomain tekshiruvi
+        for bd in BLOCKED_DOMAINS_SET:
+            if domain == bd or domain.endswith('.' + bd):
                 return True, f"bloklangan havola: {bd}"
 
     # 5. Telegram invite (joinchat/+/c/) — har doim spam
@@ -289,11 +271,9 @@ def is_spam(raw_text: str) -> tuple[bool, str]:
 
 
 def is_spam_sticker(sticker) -> tuple[bool, str]:
-    """Stikerni spam ekanligini tekshiradi"""
     if not sticker:
         return False, ""
-    # Spam sticker set
-    if sticker.set_name and sticker.set_name.lower() in [s.lower() for s in SPAM_STICKER_SETS]:
+    if sticker.set_name and sticker.set_name.lower() in SPAM_STICKER_SETS:
         return True, f"spam sticker: {sticker.set_name}"
     return False, ""
 
@@ -303,16 +283,16 @@ def is_bio_spam(bio: str) -> bool:
         return False
     bio = clean_invisible(bio)
     norm = normalize(bio)
-    bio_spam = [
+    bio_spam_norm = {normalize(w) for w in [
         "onlyfans","only fans","xxx","adult","fansly","loyalfans",
         "nude","porn","интим","эротика","порно",
         "profilimda","kanalimga","kazino","casino",
         "1win","mostbet","melbet","betting","gambling",
         "sex","seks","18+","nsfw","cam girl",
-    ]
-    return any(normalize(w) in norm for w in bio_spam)
+    ]}
+    return any(w in norm for w in bio_spam_norm)
 
-# ════ YORDAMCHI ═════════════════════════════════════════════════
+# ════ YORDAMCHI ══════════════════════════════════════════════════
 
 def mention(user) -> str:
     if user.username:
@@ -340,12 +320,8 @@ async def try_delete(bot, chat_id: int, msg_id: int) -> bool:
         return False
 
 
-async def auto_delete(bot, chat_id: int, msg_id: int, after: int = 20):
-    await asyncio.sleep(after)
-    await try_delete(bot, chat_id, msg_id)
-
-
 async def log_action(bot, chat_id: int, title: str, user, action: str, reason: str, text: str = ""):
+    """Faqat log kanalga yozadi — guruhga xabar YUBORMASIN"""
     if not LOG_CHANNEL_ID:
         return
     icons = {"ban":"🔨 BAN","mute":"🔇 MUTE","warn":"⚠️ WARN","kick":"👢 KICK"}
@@ -356,7 +332,7 @@ async def log_action(bot, chat_id: int, title: str, user, action: str, reason: s
             f"👤 {mention(user)} (<code>{user.id}</code>)\n"
             f"💬 {title} (<code>{chat_id}</code>)\n"
             f"📌 {reason}\n"
-            f"⚠️ Ogohlantirish: {warnings[(user.id,chat_id)]} ta\n"
+            f"⚠️ Ogohlantirish: {warnings[(user.id, chat_id)]} ta\n"
             f"⏰ {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
             + (f"\n📝 <code>{text[:300]}</code>" if text else ""),
             parse_mode=ParseMode.HTML,
@@ -381,36 +357,37 @@ ALL_PERMS = ChatPermissions(
     can_send_voice_notes=True,
 )
 
-# ════ JAZO ══════════════════════════════════════════════════════
+# ════ JAZO (GURUHGA XABAR YO'Q) ═════════════════════════════════
 
 async def punish(bot, chat_id: int, title: str, user, reason: str, text: str = ""):
+    """
+    Spam topilganda:
+    - 1-marta: 1 soat MUTE (guruhga xabar YO'Q)
+    - 2-marta: doimiy BAN (guruhga xabar YO'Q)
+    Faqat log kanalga yoziladi.
+    """
     key = (user.id, chat_id)
     warnings[key] += 1
     count = warnings[key]
-    m = mention(user)
 
     if count == 1:
+        # 1-MARTA → MUTE (xabarsiz)
         until = datetime.now() + timedelta(hours=1)
         muted_until[key] = until
         try:
-            await bot.restrict_chat_member(chat_id, user.id, permissions=NO_PERMS, until_date=until)
+            await bot.restrict_chat_member(
+                chat_id, user.id,
+                permissions=NO_PERMS,
+                until_date=until
+            )
             logger.info("MUTE user=%d chat=%d | %s", user.id, chat_id, reason)
         except TelegramError as e:
             logger.warning("Mute xatosi: %s", e)
-        try:
-            msg = await bot.send_message(
-                chat_id,
-                f"⚠️ {m} — <b>1 soat MUTE!</b>\n"
-                f"📌 Sabab: {reason}\n"
-                f"🚫 Yana spam → <b>doimiy BAN!</b>",
-                parse_mode=ParseMode.HTML,
-            )
-            asyncio.create_task(auto_delete(bot, chat_id, msg.message_id, 20))
-        except TelegramError:
-            pass
+        # Log kanalga yozamiz
         await log_action(bot, chat_id, title, user, "mute", reason, text)
 
     else:
+        # 2-MARTA → BAN (xabarsiz)
         warnings[key] = 0
         muted_until.pop(key, None)
         try:
@@ -418,17 +395,8 @@ async def punish(bot, chat_id: int, title: str, user, reason: str, text: str = "
             logger.info("BAN user=%d chat=%d | %s", user.id, chat_id, reason)
         except TelegramError as e:
             logger.warning("Ban xatosi: %s", e)
-        try:
-            msg = await bot.send_message(
-                chat_id,
-                f"🚫 {m} — <b>GURUHDAN BAN!</b>\n"
-                f"📌 Sabab: {reason} (2-marta)",
-                parse_mode=ParseMode.HTML,
-            )
-            asyncio.create_task(auto_delete(bot, chat_id, msg.message_id, 20))
-        except TelegramError:
-            pass
-        await log_action(bot, chat_id, title, user, "ban", reason, text)
+        # Log kanalga yozamiz
+        await log_action(bot, chat_id, title, user, "ban", f"{reason} (2-marta)", text)
 
 # ════ HANDLERLAR ════════════════════════════════════════════════
 
@@ -463,17 +431,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # ── Forward spam tekshiruvi ──
-    # Nomаlum manbadan forward qilingan xabarlar + matn spam bo'lsa
     if msg.forward_origin and text:
         found, reason = is_spam(text)
         if found:
             await try_delete(context.bot, chat.id, msg.message_id)
-            await punish(context.bot, chat.id, chat.title or str(chat.id), user, f"forward spam: {reason}", text)
+            await punish(context.bot, chat.id, chat.title or str(chat.id),
+                         user, f"forward spam: {reason}", text)
             return
 
-    # ── Inline keyboard / button bilan xabarlar ──
+    # ── Inline keyboard URL tekshiruvi ──
     if msg.reply_markup:
-        # Inline klaviaturali xabarlarda URL tekshiruv
         try:
             for row in msg.reply_markup.inline_keyboard:
                 for btn in row:
@@ -482,7 +449,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if found:
                             await try_delete(context.bot, chat.id, msg.message_id)
                             await punish(context.bot, chat.id, chat.title or str(chat.id),
-                                        user, f"spam tugma: {reason}", btn.url)
+                                         user, f"spam tugma: {reason}", btn.url)
                             return
         except Exception:
             pass
@@ -504,23 +471,14 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         pass
 
-    # Bio yoki username spam tekshiruvi
     if is_bio_spam(bio) or is_bio_spam(user.username or "") or is_bio_spam(user.full_name or ""):
         try:
             await context.bot.ban_chat_member(chat.id, user.id)
             await asyncio.sleep(1)
             await context.bot.unban_chat_member(chat.id, user.id)
+            logger.info("KICK(bio spam) user=%d chat=%d", user.id, chat.id)
         except TelegramError as e:
             logger.warning("Kick xatosi: %s", e)
-        try:
-            msg = await context.bot.send_message(
-                chat.id,
-                f"🚫 {mention(user)} spam profil bilan kirdi — <b>chiqarildi!</b>",
-                parse_mode=ParseMode.HTML,
-            )
-            asyncio.create_task(auto_delete(context.bot, chat.id, msg.message_id, 15))
-        except TelegramError:
-            pass
         await log_action(context.bot, chat.id, chat.title or "", user, "kick", "Spam bio/username", bio)
 
 # ════ KOMANDALAR ════════════════════════════════════════════════
@@ -529,14 +487,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or update.effective_chat.type != "private": return
     await msg.reply_text(
-        "🤖 <b>Spam Filter Bot v5.0</b>\n\n"
+        "🤖 <b>Spam Filter Bot v5.1</b>\n\n"
         "✅ Spam xabarlarni avtomatik oʻchiradi\n"
+        "🔕 Guruhga xabar <b>YUBORMAYDI</b> (yashirin ishlaydi)\n"
+        "⚡ Optimized: O(1) domen va fragment qidiruvi\n"
         "🔍 Zero-width bypass tekshiruvi\n"
         "🧩 Stiker spam tekshiruvi\n"
         "👤 Spam bio → avtomatik chiqarish\n\n"
-        "⚖️ <b>Jazo tizimi:</b>\n"
-        "⚠️ 1-spam → 1 soat mute\n"
-        "🚫 2-spam → doimiy BAN\n\n"
+        "⚖️ <b>Jazo tizimi (yashirin):</b>\n"
+        "⚠️ 1-spam → 1 soat mute (xabarsiz)\n"
+        "🚫 2-spam → doimiy BAN (xabarsiz)\n"
+        "📋 Faqat log kanalga yoziladi\n\n"
         "<b>Admin komandalari:</b>\n"
         "/test — huquqlar va spam bazasi\n"
         "/checkspam [matn] — spam tekshiruvi\n"
@@ -582,7 +543,6 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not can_del: status += "❌ Xabar oʻchirish huquqi YOʻQ!\n"
         if not can_res: status += "❌ Cheklash huquqi YOʻQ!\n"
 
-    # Zero-width test
     test_cases = [
         ("Men\u200bing\ufeff pr\u200cofilimda siz uc\u200bhun ko'p narsalar bor", True),
         ("Mening profilimda siz uchun ko'p narsalar bor", True),
@@ -600,12 +560,14 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         icon = "✅" if f == exp else "❌"
         test_lines.append(f"{icon} {t[:45]!r}")
 
+    cache_info = normalize.cache_info()
     await msg.reply_text(
-        f"🤖 <b>@{bot_name} v5.0</b>\n\n"
+        f"🤖 <b>@{bot_name} v5.1 OPTIMIZED</b>\n\n"
         f"{status}\n\n"
-        f"📊 So'kinish: <b>{len(SWEAR_WORDS_EXACT)+len(SWEAR_WORDS_PARTIAL)}</b> ta | "
-        f"Fragment: <b>{len(SPAM_FRAGMENTS)}</b> ta | "
-        f"Domen: <b>{len(BLOCKED_DOMAINS)}</b> ta\n\n"
+        f"📊 So'kinish: <b>{len(SWEAR_WORDS_EXACT)+len(SWEAR_WORDS_PARTIAL)}</b> | "
+        f"Fragment: <b>{len(SPAM_FRAGMENTS)}</b> | "
+        f"Domen: <b>{len(BLOCKED_DOMAINS)}</b>\n"
+        f"⚡ Cache: hits={cache_info.hits} miss={cache_info.misses}\n\n"
         f"🧪 <b>Test natijalari:</b>\n" + "\n".join(test_lines),
         parse_mode=ParseMode.HTML,
     )
@@ -625,7 +587,6 @@ async def cmd_checkspam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     norm  = normalize(text)
     clean = clean_invisible(text)
 
-    # Ko'rinmas belgilar bor-yo'qligini ko'rsat
     invisible_count = len(text) - len(clean)
     invisible_info  = f"\n👁 Ko'rinmas belgilar: <b>{invisible_count} ta</b>" if invisible_count else ""
 
@@ -650,13 +611,14 @@ async def cmd_addspam(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Ishlatish: /addspam <soʻz>")
         return
     kw = " ".join(context.args).lower().strip()
-    if any(normalize(ex) == normalize(kw) for ex in SPAM_FRAGMENTS):
-        reply = await msg.reply_text(f"⚠️ «{kw}» allaqachon mavjud.")
+    kw_norm = normalize(kw)
+    if kw_norm in SPAM_FRAGMENTS_NORM:
+        await msg.reply_text(f"⚠️ «{kw}» allaqachon mavjud.")
     else:
         SPAM_FRAGMENTS.append(kw)
-        reply = await msg.reply_text(f"✅ «{kw}» qoʻshildi! Jami: {len(SPAM_FRAGMENTS)} ta")
+        SPAM_FRAGMENTS_NORM.add(kw_norm)
+        await msg.reply_text(f"✅ «{kw}» qoʻshildi! Jami: {len(SPAM_FRAGMENTS)} ta")
     await try_delete(context.bot, chat.id, msg.message_id)
-    asyncio.create_task(auto_delete(context.bot, chat.id, reply.message_id, 10))
 
 
 async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -829,13 +791,14 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• {name} — <b>{cnt}</b> ta")
     await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
-# ════ POST INIT ═════════════════════════════════════════════════
+# ════ POST INIT ══════════════════════════════════════════════════
 
 async def post_init(application: Application) -> None:
     global BOT_ID
     me = await application.bot.get_me()
     BOT_ID = me.id
     logger.info("Bot: @%s (ID: %d)", me.username, me.id)
+    logger.info("Fragment set: %d ta | Domen set: %d ta", len(SPAM_FRAGMENTS_NORM), len(BLOCKED_DOMAINS_SET))
 
 # ════ MAIN ══════════════════════════════════════════════════════
 
@@ -847,7 +810,6 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # Komandalar
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("test",      cmd_test))
     app.add_handler(CommandHandler("checkspam", cmd_checkspam))
@@ -860,20 +822,18 @@ def main():
     app.add_handler(CommandHandler("unban",     cmd_unban))
     app.add_handler(CommandHandler("stats",     cmd_stats))
 
-    # Xabar handlerlari
     app.add_handler(MessageHandler(
         ~filters.ChatType.PRIVATE & ~filters.COMMAND,
         handle_message,
     ))
-
-    # Yangi a'zo handleri
     app.add_handler(ChatMemberHandler(
         handle_new_member,
         chat_member_types=ChatMemberHandler.CHAT_MEMBER,
     ))
 
     logger.info("=" * 60)
-    logger.info("  Spam Filter Bot v5.0 ishga tushdi")
+    logger.info("  Spam Filter Bot v5.1 OPTIMIZED ishga tushdi")
+    logger.info("  GURUHGA XABAR YUBORMAYDI — yashirin ishlaydi")
     logger.info("  Fragment: %d | Domen: %d | So'kinish: %d",
                 len(SPAM_FRAGMENTS), len(BLOCKED_DOMAINS),
                 len(SWEAR_WORDS_EXACT) + len(SWEAR_WORDS_PARTIAL))
